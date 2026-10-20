@@ -1567,7 +1567,19 @@ unsafe fn wm_size(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> O
     let mut should_pump = false;
 
     if let Some(inner) = rc_from_hwnd(hwnd) {
-        let mut inner = inner.borrow_mut();
+        let mut inner = match inner.try_borrow_mut() {
+            Ok(inner) => inner,
+            Err(_) => {
+                // IME APIs can re-enter this handler while WindowInner is borrowed.
+                Connection::with_window_inner(HWindow(hwnd), |inner| {
+                    if !inner.hwnd.0.is_null() && inner.check_and_call_resize_if_needed() {
+                        unsafe { InvalidateRect(inner.hwnd.0, null(), 0) };
+                    }
+                    Ok(())
+                });
+                return Some(0);
+            }
+        };
         should_paint = inner.check_and_call_resize_if_needed();
         should_pump = inner.in_size_move;
     }
@@ -2990,5 +3002,79 @@ unsafe extern "system" fn wnd_proc(
             log::error!("caught {:?}", e);
             std::process::exit(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reentrant_resize_is_delivered_after_window_borrow_ends() {
+        let conn = Connection::init().unwrap();
+        let config = ConfigHandle::default_config();
+        let sizes = Rc::new(RefCell::new(Vec::new()));
+        let received = Rc::clone(&sizes);
+        let window = promise::spawn::block_on(Window::new_window(
+            "wezterm-resize-reentrancy-test",
+            "resize reentrancy test",
+            RequestedWindowGeometry {
+                width: config::Dimension::Pixels(320.0),
+                height: config::Dimension::Pixels(240.0),
+                x: Some(config::Dimension::Pixels(0.0)),
+                y: Some(config::Dimension::Pixels(0.0)),
+                origin: crate::GeometryOrigin::ScreenCoordinateSystem,
+            },
+            Some(&config),
+            Rc::new(FontConfiguration::new(Some(config.clone()), 96).unwrap()),
+            move |event, _| {
+                if let WindowEvent::Resized { dimensions, .. } = event {
+                    received.borrow_mut().push(dimensions);
+                }
+            },
+        ))
+        .unwrap();
+        let inner = conn.get_window(window.0).unwrap();
+        crate::spawn::SPAWN_QUEUE.run();
+        sizes.borrow_mut().clear();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let borrowed = inner.borrow_mut();
+            for width in [640, 800] {
+                assert_ne!(
+                    unsafe {
+                        SetWindowPos(
+                            window.0 .0,
+                            null_mut(),
+                            0,
+                            0,
+                            width,
+                            600,
+                            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                        )
+                    },
+                    0
+                );
+            }
+            assert!(sizes.borrow().is_empty());
+            drop(borrowed);
+            crate::spawn::SPAWN_QUEUE.run();
+
+            let mut client: RECT = unsafe { std::mem::zeroed() };
+            assert_ne!(unsafe { GetClientRect(window.0 .0, &mut client) }, 0);
+            let sizes = sizes.borrow();
+            assert_eq!(sizes.len(), 1);
+            assert_eq!(sizes[0].pixel_width, rect_width(&client) as usize);
+            assert_eq!(sizes[0].pixel_height, rect_height(&client) as usize);
+        }));
+
+        let borrowed = inner.borrow();
+        assert_eq!(unsafe { wm_size(window.0 .0, 0, 0, 0) }, Some(0));
+        drop(borrowed);
+        assert_ne!(unsafe { DestroyWindow(window.0 .0) }, 0);
+        crate::spawn::SPAWN_QUEUE.run();
+        crate::connection::shutdown();
+        result.unwrap();
+        assert_eq!(sizes.borrow().len(), 1);
     }
 }
